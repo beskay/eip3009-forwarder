@@ -9,7 +9,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 /**
  * @title EIP3009Forwarder
- * @author TheGreatAxios
+ * @author TheGreatAxios, Beskay
  * @notice A contract that enables gas-less ERC-20 token transfers using EIP-712 signatures.
  * @dev This contract acts as a forwarder for any standard ERC-20 token, allowing a third-party (relayer)
  * to submit a pre-signed authorization to execute a transfer on behalf of a token holder. The token holder
