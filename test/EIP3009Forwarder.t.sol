@@ -4,6 +4,8 @@ pragma solidity ^0.8.0;
 import {Test} from "forge-std/Test.sol";
 import {EIP3009Forwarder} from "../src/EIP3009Forwarder.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 
 /**
  * @notice A mock ERC20 token for testing purposes.
@@ -39,6 +41,31 @@ contract MockERC20 is IERC20 {
         balanceOf[from] -= amount;
         balanceOf[to] += amount;
         return true;
+    }
+}
+
+/**
+ * @notice A mock ERC-1271 contract wallet for testing purposes.
+ */
+contract MockERC1271Wallet is IERC1271 {
+    using ECDSA for bytes32;
+
+    address public immutable owner;
+
+    constructor(address _owner) {
+        owner = _owner;
+    }
+
+    function approveToken(IERC20 token, address spender, uint256 amount) external {
+        token.approve(spender, amount);
+    }
+
+    function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4) {
+        (address recovered, ECDSA.RecoverError err, ) = ECDSA.tryRecover(hash, signature);
+        if (err == ECDSA.RecoverError.NoError && recovered == owner) {
+            return IERC1271.isValidSignature.selector;
+        }
+        return 0xffffffff;
     }
 }
 
@@ -152,6 +179,10 @@ contract EIP3009ForwarderTest is Test {
         (v, r, s) = vm.sign(privateKey, digest);
     }
 
+    function _encodeEOASignature(uint8 v, bytes32 r, bytes32 s) internal pure returns (bytes memory) {
+        return abi.encodePacked(r, s, v);
+    }
+
     // =============================================================
     //                       Success Scenarios
     // =============================================================
@@ -171,6 +202,29 @@ contract EIP3009ForwarderTest is Test {
         // Act: Relayer submits the transaction
         vm.prank(relayer);
         forwarder.transferWithAuthorization(alice, bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, v, r, s);
+
+        // Assert
+        assertEq(token.balanceOf(alice), INITIAL_MINT_AMOUNT - TRANSFER_AMOUNT, "Alice's balance should decrease");
+        assertEq(token.balanceOf(bob), TRANSFER_AMOUNT, "Bob's balance should increase");
+        assertTrue(forwarder.authorizationState(alice, nonce), "Nonce should be marked as used");
+    }
+
+    function test_succeeds_transferWithAuthorization_bytesSignature() public {
+        // Arrange
+        uint256 validAfter = 0;
+        uint256 validBefore = block.timestamp + 1 hours;
+        bytes32 nonce = keccak256("nonce1-bytes");
+
+        (uint8 v, bytes32 r, bytes32 s) = _signTransfer(alice, bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, alicePrivateKey);
+        bytes memory signature = _encodeEOASignature(v, r, s);
+
+        // Expect event
+        vm.expectEmit(true, true, true, true);
+        emit EIP3009Forwarder.AuthorizationUsed(alice, nonce);
+
+        // Act: Relayer submits the transaction
+        vm.prank(relayer);
+        forwarder.transferWithAuthorization(alice, bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, signature);
 
         // Assert
         assertEq(token.balanceOf(alice), INITIAL_MINT_AMOUNT - TRANSFER_AMOUNT, "Alice's balance should decrease");
@@ -200,6 +254,29 @@ contract EIP3009ForwarderTest is Test {
         assertTrue(forwarder.authorizationState(alice, nonce));
     }
 
+    function test_succeeds_receiveWithAuthorization_bytesSignature() public {
+        // Arrange
+        uint256 validAfter = 0;
+        uint256 validBefore = block.timestamp + 1 hours;
+        bytes32 nonce = keccak256("nonce2-bytes");
+
+        (uint8 v, bytes32 r, bytes32 s) = _signReceive(alice, bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, alicePrivateKey);
+        bytes memory signature = _encodeEOASignature(v, r, s);
+
+        // Expect event
+        vm.expectEmit(true, true, true, true);
+        emit EIP3009Forwarder.AuthorizationUsed(alice, nonce);
+
+        // Act: Bob (the recipient) submits the transaction
+        vm.prank(bob);
+        forwarder.receiveWithAuthorization(alice, bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, signature);
+
+        // Assert
+        assertEq(token.balanceOf(alice), INITIAL_MINT_AMOUNT - TRANSFER_AMOUNT);
+        assertEq(token.balanceOf(bob), TRANSFER_AMOUNT);
+        assertTrue(forwarder.authorizationState(alice, nonce));
+    }
+
     function test_succeeds_cancelAuthorization() public {
         // Arrange
         bytes32 nonceToCancel = keccak256("nonce-to-cancel");
@@ -220,6 +297,56 @@ contract EIP3009ForwarderTest is Test {
         vm.expectRevert(EIP3009Forwarder.AuthorizationAlreadyUsed.selector);
         (v, r, s) = _signTransfer(alice, bob, TRANSFER_AMOUNT, 0, block.timestamp + 1 hours, nonceToCancel, alicePrivateKey);
         forwarder.transferWithAuthorization(alice, bob, TRANSFER_AMOUNT, 0, block.timestamp + 1 hours, nonceToCancel, v, r, s);
+    }
+
+    function test_succeeds_cancelAuthorization_bytesSignature() public {
+        // Arrange
+        bytes32 nonceToCancel = keccak256("nonce-to-cancel-bytes");
+        (uint8 v, bytes32 r, bytes32 s) = _signCancel(alice, nonceToCancel, alicePrivateKey);
+        bytes memory signature = _encodeEOASignature(v, r, s);
+
+        // Expect event
+        vm.expectEmit(true, true, true, true);
+        emit EIP3009Forwarder.AuthorizationCanceled(alice, nonceToCancel);
+
+        // Act: Alice cancels the authorization
+        vm.prank(alice);
+        forwarder.cancelAuthorization(alice, nonceToCancel, signature);
+
+        // Assert: Nonce is used
+        assertTrue(forwarder.authorizationState(alice, nonceToCancel), "Nonce should be marked as used after cancellation");
+    }
+
+    function test_succeeds_transferWithAuthorization_contractWalletSignature() public {
+        // Arrange
+        MockERC1271Wallet wallet = new MockERC1271Wallet(alice);
+        vm.label(address(wallet), "AliceContractWallet");
+
+        token.mint(address(wallet), TRANSFER_AMOUNT);
+
+        vm.prank(address(wallet));
+        wallet.approveToken(token, address(forwarder), type(uint256).max);
+
+        uint256 validAfter = 0;
+        uint256 validBefore = block.timestamp + 1 hours;
+        bytes32 nonce = keccak256("nonce-contract-wallet");
+
+        (uint8 v, bytes32 r, bytes32 s) =
+            _signTransfer(address(wallet), bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, alicePrivateKey);
+        bytes memory signature = _encodeEOASignature(v, r, s);
+
+        // Expect event
+        vm.expectEmit(true, true, true, true);
+        emit EIP3009Forwarder.AuthorizationUsed(address(wallet), nonce);
+
+        // Act: Relayer submits the transaction
+        vm.prank(relayer);
+        forwarder.transferWithAuthorization(address(wallet), bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, signature);
+
+        // Assert
+        assertEq(token.balanceOf(address(wallet)), 0);
+        assertEq(token.balanceOf(bob), TRANSFER_AMOUNT);
+        assertTrue(forwarder.authorizationState(address(wallet), nonce));
     }
 
     // =============================================================
@@ -247,6 +374,16 @@ contract EIP3009ForwarderTest is Test {
         
         vm.expectRevert(EIP3009Forwarder.InvalidSignature.selector);
         forwarder.transferWithAuthorization(alice, bob, TRANSFER_AMOUNT, 0, block.timestamp + 1, nonce, v, r, s);
+    }
+
+    function test_reverts_if_signature_invalid_bytesSignature() public {
+        bytes32 nonce = keccak256("invalid-sig-nonce-bytes");
+        uint256 bobPrivateKey = 0xB0B;
+        (uint8 v, bytes32 r, bytes32 s) = _signTransfer(alice, bob, TRANSFER_AMOUNT, 0, block.timestamp + 1, nonce, bobPrivateKey);
+        bytes memory signature = _encodeEOASignature(v, r, s);
+
+        vm.expectRevert(EIP3009Forwarder.InvalidSignature.selector);
+        forwarder.transferWithAuthorization(alice, bob, TRANSFER_AMOUNT, 0, block.timestamp + 1, nonce, signature);
     }
 
     function test_reverts_if_authorization_expired() public {

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.0;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -15,8 +16,6 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  * must first approve this contract to spend their tokens. This implementation is based on EIP-3009.
  */
 contract EIP3009Forwarder is EIP712, ReentrancyGuard {
-    using ECDSA for bytes32;
-
     // =============================================================
     //                           State
     // =============================================================
@@ -126,6 +125,29 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
     // =============================================================
 
     /**
+     * @notice Execute a transfer with a signed authorization
+     * @dev EOA wallet signatures should be packed in the order of r, s, v.
+     * @param from          Payer's address (Authorizer)
+     * @param to            Payee's address
+     * @param value         Amount to be transferred
+     * @param validAfter    The time after which this is valid (unix time)
+     * @param validBefore   The time before which this is valid (unix time)
+     * @param nonce         Unique nonce
+     * @param signature     Signature bytes signed by an EOA wallet or a contract wallet
+     */
+    function transferWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes memory signature
+    ) external nonReentrant {
+        _transferWithAuthorization(from, to, value, validAfter, validBefore, nonce, signature);
+    }
+
+    /**
      * @notice Executes a token transfer authorized by a EIP-712 signature.
      * @dev This function can be called by anyone (a "relayer") who possesses a valid signature from the `from` address.
      * The `from` address must have approved this contract to spend at least `value` of their tokens.
@@ -150,6 +172,18 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
         bytes32 r,
         bytes32 s
     ) external nonReentrant {
+        _transferWithAuthorization(from, to, value, validAfter, validBefore, nonce, abi.encodePacked(r, s, v));
+    }
+
+    function _transferWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes memory signature
+    ) internal {
         if (from == address(0) || to == address(0)) revert ZeroAddress();
         if (validAfter > validBefore) revert InvalidAuthorizationDates();
         if (block.timestamp < validAfter) revert AuthorizationNotYetValid();
@@ -169,11 +203,9 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
             )
         );
         // forge-lint: disable-end(asm-keccak256)
-        
+
         bytes32 hash = _hashTypedDataV4(structHash);
-        address signer = hash.recover(v, r, s);
-        
-        if (signer != from) revert InvalidSignature();
+        if (!_isValidSignatureNow(from, hash, signature)) revert InvalidSignature();
 
         // Checks-Effects-Interactions: Update state before external call.
         _authorizationStates[from][nonce] = true;
@@ -184,6 +216,29 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
 
         bool success = TOKEN.transferFrom(from, to, value);
         require(success, "Transfer failed");
+    }
+
+    /**
+     * @notice Execute a transfer where the recipient must submit
+     * @dev EOA wallet signatures should be packed in the order of r, s, v.
+     * @param from          Payer's address (Authorizer)
+     * @param to            Payee's address, must equal `msg.sender`
+     * @param value         Amount to be transferred
+     * @param validAfter    The time after which this is valid (unix time)
+     * @param validBefore   The time before which this is valid (unix time)
+     * @param nonce         Unique nonce
+     * @param signature     Signature bytes signed by an EOA wallet or a contract wallet
+     */
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes memory signature
+    ) external nonReentrant {
+        _receiveWithAuthorization(from, to, value, validAfter, validBefore, nonce, signature);
     }
 
     /**
@@ -211,13 +266,25 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
         bytes32 r,
         bytes32 s
     ) external nonReentrant {
+        _receiveWithAuthorization(from, to, value, validAfter, validBefore, nonce, abi.encodePacked(r, s, v));
+    }
+
+    function _receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        bytes memory signature
+    ) internal {
         if (to != msg.sender) revert InvalidSignature();
         if (from == address(0)) revert ZeroAddress();
         if (validAfter > validBefore) revert InvalidAuthorizationDates();
         if (block.timestamp < validAfter) revert AuthorizationNotYetValid();
         if (block.timestamp > validBefore) revert AuthorizationExpired();
         if (_authorizationStates[from][nonce]) revert AuthorizationAlreadyUsed();
-        
+
         // forge-lint: disable-start(asm-keccak256)
         bytes32 structHash = keccak256(
             abi.encode(
@@ -231,10 +298,9 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
             )
         );
         // forge-lint: disable-end(asm-keccak256)
+
         bytes32 hash = _hashTypedDataV4(structHash);
-        address signer = hash.recover(v, r, s);
-        
-        if (signer != from) revert InvalidSignature();
+        if (!_isValidSignatureNow(from, hash, signature)) revert InvalidSignature();
 
         // Checks-Effects-Interactions: Update state before external call.
         _authorizationStates[from][nonce] = true;
@@ -245,6 +311,21 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
 
         bool success = TOKEN.transferFrom(from, to, value);
         require(success, "Transfer failed");
+    }
+
+    /**
+     * @notice Cancel an unused authorization with a signed cancellation
+     * @dev EOA wallet signatures should be packed in the order of r, s, v.
+     * @param authorizer    The address that is canceling the authorization
+     * @param nonce         The nonce of the authorization to cancel
+     * @param signature     Signature bytes signed by an EOA wallet or a contract wallet
+     */
+    function cancelAuthorization(
+        address authorizer,
+        bytes32 nonce,
+        bytes memory signature
+    ) external {
+        _cancelAuthorization(authorizer, nonce, signature);
     }
 
     /**
@@ -263,6 +344,10 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
         bytes32 r,
         bytes32 s
     ) external {
+        _cancelAuthorization(authorizer, nonce, abi.encodePacked(r, s, v));
+    }
+
+    function _cancelAuthorization(address authorizer, bytes32 nonce, bytes memory signature) internal {
         if (_authorizationStates[authorizer][nonce]) revert AuthorizationAlreadyUsed();
 
         // forge-lint: disable-start(asm-keccak256)
@@ -272,12 +357,32 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
         // forge-lint: disable-end(asm-keccak256)
 
         bytes32 hash = _hashTypedDataV4(structHash);
-        address signer = hash.recover(v, r, s);
-        
-        if (signer != authorizer) revert InvalidSignature();
+        if (!_isValidSignatureNow(authorizer, hash, signature)) revert InvalidSignature();
 
         _authorizationStates[authorizer][nonce] = true;
         emit AuthorizationCanceled(authorizer, nonce);
+    }
+
+    function _isValidSignatureNow(address signer, bytes32 hash, bytes memory signature) internal view returns (bool) {
+        if (signer.code.length == 0) {
+            // Some clients produce `v` as 0/1. Normalize to 27/28 for 65-byte ECDSA signatures.
+            if (signature.length == 65) {
+                uint8 v = uint8(signature[64]);
+                if (v == 0 || v == 1) {
+                    signature[64] = bytes1(v + 27);
+                }
+            }
+
+            (address recovered, ECDSA.RecoverError err, ) = ECDSA.tryRecover(hash, signature);
+            return err == ECDSA.RecoverError.NoError && recovered == signer;
+        }
+
+        (bool success, bytes memory result) = signer.staticcall(
+            abi.encodeCall(IERC1271.isValidSignature, (hash, signature))
+        );
+        return (success &&
+            result.length >= 32 &&
+            abi.decode(result, (bytes32)) == bytes32(IERC1271.isValidSignature.selector));
     }
 
 
