@@ -4,6 +4,7 @@ pragma solidity ^0.8.0;
 import {Test} from "forge-std/Test.sol";
 import {EIP3009Forwarder} from "../src/EIP3009Forwarder.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 
@@ -61,6 +62,39 @@ contract MockERC1271Wallet is IERC1271 {
     }
 
     function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4) {
+        (address recovered, ECDSA.RecoverError err, ) = ECDSA.tryRecover(hash, signature);
+        if (err == ECDSA.RecoverError.NoError && recovered == owner) {
+            return IERC1271.isValidSignature.selector;
+        }
+        return 0xffffffff;
+    }
+}
+
+/**
+ * @notice A mock ERC-1271 wallet that burns gas during validation.
+ */
+contract MockERC1271WalletGasGuzzler is IERC1271 {
+    using ECDSA for bytes32;
+
+    address public immutable owner;
+    uint256 public gasToConsume;
+
+    constructor(address _owner) {
+        owner = _owner;
+    }
+
+    function setGasToConsume(uint256 _gasToConsume) external {
+        gasToConsume = _gasToConsume;
+    }
+
+    function approveToken(IERC20 token, address spender, uint256 amount) external {
+        token.approve(spender, amount);
+    }
+
+    function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4) {
+        uint256 gasStart = gasleft();
+        while (gasStart - gasleft() < gasToConsume) {}
+
         (address recovered, ECDSA.RecoverError err, ) = ECDSA.tryRecover(hash, signature);
         if (err == ECDSA.RecoverError.NoError && recovered == owner) {
             return IERC1271.isValidSignature.selector;
@@ -324,7 +358,6 @@ contract EIP3009ForwarderTest is Test {
 
         token.mint(address(wallet), TRANSFER_AMOUNT);
 
-        vm.prank(address(wallet));
         wallet.approveToken(token, address(forwarder), type(uint256).max);
 
         uint256 validAfter = 0;
@@ -344,6 +377,120 @@ contract EIP3009ForwarderTest is Test {
         forwarder.transferWithAuthorization(address(wallet), bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, signature);
 
         // Assert
+        assertEq(token.balanceOf(address(wallet)), 0);
+        assertEq(token.balanceOf(bob), TRANSFER_AMOUNT);
+        assertTrue(forwarder.authorizationState(address(wallet), nonce));
+    }
+
+    function test_succeeds_receiveWithAuthorization_contractWalletSignature() public {
+        // Arrange
+        MockERC1271Wallet wallet = new MockERC1271Wallet(alice);
+        vm.label(address(wallet), "AliceContractWallet");
+
+        token.mint(address(wallet), TRANSFER_AMOUNT);
+
+        wallet.approveToken(token, address(forwarder), type(uint256).max);
+
+        uint256 validAfter = 0;
+        uint256 validBefore = block.timestamp + 1 hours;
+        bytes32 nonce = keccak256("nonce-contract-wallet-receive");
+
+        (uint8 v, bytes32 r, bytes32 s) =
+            _signReceive(address(wallet), bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, alicePrivateKey);
+        bytes memory signature = _encodeEOASignature(v, r, s);
+
+        // Expect event
+        vm.expectEmit(true, true, true, true);
+        emit EIP3009Forwarder.AuthorizationUsed(address(wallet), nonce);
+
+        // Act: Bob (the recipient) submits the transaction
+        vm.prank(bob);
+        forwarder.receiveWithAuthorization(address(wallet), bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, signature);
+
+        // Assert
+        assertEq(token.balanceOf(address(wallet)), 0);
+        assertEq(token.balanceOf(bob), TRANSFER_AMOUNT);
+        assertTrue(forwarder.authorizationState(address(wallet), nonce));
+    }
+
+    function test_succeeds_cancelAuthorization_contractWalletSignature() public {
+        // Arrange
+        MockERC1271Wallet wallet = new MockERC1271Wallet(alice);
+        vm.label(address(wallet), "AliceContractWallet");
+
+        bytes32 nonceToCancel = keccak256("nonce-contract-wallet-cancel");
+        (uint8 v, bytes32 r, bytes32 s) = _signCancel(address(wallet), nonceToCancel, alicePrivateKey);
+        bytes memory signature = _encodeEOASignature(v, r, s);
+
+        // Expect event
+        vm.expectEmit(true, true, true, true);
+        emit EIP3009Forwarder.AuthorizationCanceled(address(wallet), nonceToCancel);
+
+        // Act
+        vm.prank(relayer);
+        forwarder.cancelAuthorization(address(wallet), nonceToCancel, signature);
+
+        // Assert
+        assertTrue(forwarder.authorizationState(address(wallet), nonceToCancel));
+
+        // Assert: cannot use the canceled nonce for a transfer
+        vm.expectRevert(EIP3009Forwarder.AuthorizationAlreadyUsed.selector);
+        (v, r, s) =
+            _signTransfer(address(wallet), bob, TRANSFER_AMOUNT, 0, block.timestamp + 1 hours, nonceToCancel, alicePrivateKey);
+        signature = _encodeEOASignature(v, r, s);
+        forwarder.transferWithAuthorization(address(wallet), bob, TRANSFER_AMOUNT, 0, block.timestamp + 1 hours, nonceToCancel, signature);
+    }
+
+    function test_reverts_transferWithAuthorization_contractWalletSignature_invalidSignature() public {
+        // Arrange
+        MockERC1271Wallet wallet = new MockERC1271Wallet(alice);
+
+        uint256 validAfter = 0;
+        uint256 validBefore = block.timestamp + 1 hours;
+        bytes32 nonce = keccak256("nonce-contract-wallet-invalid");
+
+        uint256 bobPrivateKey = 0xB0B;
+        (uint8 v, bytes32 r, bytes32 s) =
+            _signTransfer(address(wallet), bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, bobPrivateKey);
+        bytes memory signature = _encodeEOASignature(v, r, s);
+
+        // Act & Assert
+        vm.expectRevert(EIP3009Forwarder.InvalidSignature.selector);
+        vm.prank(relayer);
+        forwarder.transferWithAuthorization(address(wallet), bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, signature);
+        assertFalse(forwarder.authorizationState(address(wallet), nonce));
+    }
+
+    function test_reverts_then_succeeds_transferWithAuthorization_contractWalletSignature_when_gas_stipend_increases() public {
+        // Arrange
+        MockERC1271WalletGasGuzzler wallet = new MockERC1271WalletGasGuzzler(alice);
+        vm.label(address(wallet), "GasGuzzlingContractWallet");
+
+        token.mint(address(wallet), TRANSFER_AMOUNT);
+        wallet.approveToken(token, address(forwarder), type(uint256).max);
+
+        uint256 validAfter = 0;
+        uint256 validBefore = block.timestamp + 1 hours;
+        bytes32 nonce = keccak256("nonce-contract-wallet-gas");
+
+        (uint8 v, bytes32 r, bytes32 s) =
+            _signTransfer(address(wallet), bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, alicePrivateKey);
+        bytes memory signature = _encodeEOASignature(v, r, s);
+
+        wallet.setGasToConsume(10_000);
+
+        // Act & Assert: too little gas stipend should fail ERC-1271 validation
+        forwarder.setERC1271GasStipend(5_000);
+        vm.expectRevert(EIP3009Forwarder.InvalidSignature.selector);
+        vm.prank(relayer);
+        forwarder.transferWithAuthorization(address(wallet), bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, signature);
+        assertFalse(forwarder.authorizationState(address(wallet), nonce));
+
+        // Act & Assert: increasing stipend allows success
+        forwarder.setERC1271GasStipend(1_000_000);
+        vm.prank(relayer);
+        forwarder.transferWithAuthorization(address(wallet), bob, TRANSFER_AMOUNT, validAfter, validBefore, nonce, signature);
+
         assertEq(token.balanceOf(address(wallet)), 0);
         assertEq(token.balanceOf(bob), TRANSFER_AMOUNT);
         assertTrue(forwarder.authorizationState(address(wallet), nonce));
@@ -451,5 +598,22 @@ contract EIP3009ForwarderTest is Test {
     function test_reverts_deploy_with_zero_address_token() public {
         vm.expectRevert(EIP3009Forwarder.ZeroAddress.selector);
         new EIP3009Forwarder(address(0), "Test", "1");
+    }
+
+    function test_succeeds_owner_can_update_erc1271_gas_stipend() public {
+        uint256 newGasStipend = 100_000;
+        forwarder.setERC1271GasStipend(newGasStipend);
+        assertEq(forwarder.erc1271GasStipend(), newGasStipend);
+    }
+
+    function test_reverts_if_non_owner_updates_erc1271_gas_stipend() public {
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, bob));
+        forwarder.setERC1271GasStipend(100_000);
+    }
+
+    function test_reverts_if_erc1271_gas_stipend_is_zero() public {
+        vm.expectRevert(EIP3009Forwarder.InvalidERC1271GasStipend.selector);
+        forwarder.setERC1271GasStipend(0);
     }
 }

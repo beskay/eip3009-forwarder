@@ -2,6 +2,8 @@
 pragma solidity ^0.8.0;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
@@ -15,7 +17,9 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  * to submit a pre-signed authorization to execute a transfer on behalf of a token holder. The token holder
  * must first approve this contract to spend their tokens. This implementation is based on EIP-3009.
  */
-contract EIP3009Forwarder is EIP712, ReentrancyGuard {
+contract EIP3009Forwarder is EIP712, ReentrancyGuard, Ownable {
+    using SafeERC20 for IERC20;
+
     // =============================================================
     //                           State
     // =============================================================
@@ -31,6 +35,12 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
      * transfer or cancellation) and cannot be used again. This is the primary replay protection mechanism.
      */
     mapping(address => mapping(bytes32 => bool)) private _authorizationStates;
+
+    /**
+     * @notice Gas stipend for ERC-1271 signature validation calls (prevents griefing).
+     * @dev Some smart wallets (plugins/modules) may require more gas. This value can be updated by the owner.
+     */
+    uint256 public erc1271GasStipend;
 
 
     // =============================================================
@@ -58,6 +68,15 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
     bytes32 private constant CANCEL_AUTHORIZATION_TYPEHASH =
         keccak256("CancelAuthorization(address authorizer,bytes32 nonce)");
 
+    // =============================================================
+    //                      ERC-1271 Defaults
+    // =============================================================
+
+    /**
+     * @dev Default gas stipend for ERC-1271 signature validation calls.
+     */
+    uint256 private constant DEFAULT_ERC1271_GAS_STIPEND = 50_000;
+
 
     // =============================================================
     //                           Events
@@ -76,6 +95,13 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
      * @param nonce The unique nonce of the authorization that was canceled.
      */
     event AuthorizationCanceled(address indexed authorizer, bytes32 indexed nonce);
+
+    /**
+     * @notice Emitted when the ERC-1271 gas stipend is updated.
+     * @param oldGasStipend Previous gas stipend.
+     * @param newGasStipend New gas stipend.
+     */
+    event ERC1271GasStipendUpdated(uint256 oldGasStipend, uint256 newGasStipend);
 
 
     // =============================================================
@@ -98,6 +124,8 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
     error InsufficientBalance();
     /// @notice The provided `validAfter` timestamp is after the `validBefore` timestamp.
     error InvalidAuthorizationDates();
+    /// @notice The provided ERC-1271 gas stipend is invalid.
+    error InvalidERC1271GasStipend();
 
 
     // =============================================================
@@ -114,9 +142,27 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
         address _token,
         string memory _name,
         string memory _version
-    ) EIP712(_name, _version) {
+    ) EIP712(_name, _version) Ownable(msg.sender) {
         if (_token == address(0)) revert ZeroAddress();
         TOKEN = IERC20(_token);
+        erc1271GasStipend = DEFAULT_ERC1271_GAS_STIPEND;
+    }
+
+    // =============================================================
+    //                      Owner Functions
+    // =============================================================
+
+    /**
+     * @notice Updates the ERC-1271 gas stipend used for contract wallet signature validation.
+     * @dev This function exists to support contract wallets that require more gas for signature checks.
+     * @param newGasStipend The new gas stipend to forward to ERC-1271 calls.
+     */
+    function setERC1271GasStipend(uint256 newGasStipend) external onlyOwner {
+        if (newGasStipend == 0) revert InvalidERC1271GasStipend();
+
+        uint256 oldGasStipend = erc1271GasStipend;
+        erc1271GasStipend = newGasStipend;
+        emit ERC1271GasStipendUpdated(oldGasStipend, newGasStipend);
     }
 
 
@@ -214,8 +260,7 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
         if (TOKEN.allowance(from, address(this)) < value) revert InsufficientAllowance();
         if (TOKEN.balanceOf(from) < value) revert InsufficientBalance();
 
-        bool success = TOKEN.transferFrom(from, to, value);
-        require(success, "Transfer failed");
+        TOKEN.safeTransferFrom(from, to, value);
     }
 
     /**
@@ -309,8 +354,7 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
         if (TOKEN.allowance(from, address(this)) < value) revert InsufficientAllowance();
         if (TOKEN.balanceOf(from) < value) revert InsufficientBalance();
 
-        bool success = TOKEN.transferFrom(from, to, value);
-        require(success, "Transfer failed");
+        TOKEN.safeTransferFrom(from, to, value);
     }
 
     /**
@@ -377,12 +421,14 @@ contract EIP3009Forwarder is EIP712, ReentrancyGuard {
             return err == ECDSA.RecoverError.NoError && recovered == signer;
         }
 
-        (bool success, bytes memory result) = signer.staticcall(
+        (bool success, bytes memory result) = signer.staticcall{gas: erc1271GasStipend}(
             abi.encodeCall(IERC1271.isValidSignature, (hash, signature))
         );
-        return (success &&
-            result.length >= 32 &&
-            abi.decode(result, (bytes32)) == bytes32(IERC1271.isValidSignature.selector));
+
+        // ERC-1271 specifies a bytes4 magic value (0x1626ba7e) returned on success.
+        // ABI encoding pads it to 32 bytes, so we can read the first 4 bytes.
+        if (!success || result.length < 32) return false;
+        return bytes4(bytes32(result)) == IERC1271.isValidSignature.selector;
     }
 
 
